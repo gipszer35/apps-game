@@ -2,6 +2,10 @@ from collections import deque
 import time
 import random
 import sys
+import json
+import os
+
+
 
 # Conditional top-level import for headless/Colab environment safety
 if "google.colab" not in sys.modules:
@@ -24,18 +28,27 @@ class Enemy:
         ]
 
     def move(self, grid, target):
-        """BFS-based pathfinding towards the player (target)."""
+        """Moves the enemy towards the target using BFS, with a chance to skip the turn."""
+        # 1. Configure the chance of freezing (doing nothing)
+        random_move_chance = 0.4 # some chance to stand still
+
+        # If the chance triggers, do absolutely nothing and stay in place
+        if random.random() < random_move_chance:
+            return self.position
+
+        # 2. Else, execute the standard BFS pathfinding logic
         queue = deque([(self.position, [])])
         visited = {self.position}
+
+        rows = len(grid)
+        cols = len(grid[0]) if rows > 0 else 0
 
         while queue:
             position, path = queue.popleft()
 
             if position == target:
                 if path:
-                    self.position = path[
-                        0
-                    ]  # Take ONLY the next single step of the shortest path
+                    self.position = path[0]  # Take ONLY the next single step
                     return self.position
                 return self.position
 
@@ -46,8 +59,8 @@ class Enemy:
                 nx, ny = nxt
 
                 if (
-                    0 <= ny < len(grid)
-                    and 0 <= nx < len(grid[0])
+                    0 <= ny < rows
+                    and 0 <= nx < cols
                     and grid[ny][nx] != "#"
                     and nxt not in visited
                 ):
@@ -74,19 +87,19 @@ class Maze:
             with open(self.filename, "r") as f:
                 lines = [line.strip() for line in f.readlines() if line.strip()]
         except FileNotFoundError:
-            # Fallback layout ideal for quick execution in Google Colab notebooks
+            # Fallback layout
             lines = [
                 "################",
                 "#P...    . E.. #",
                 "#   #.#.. #  ###",
                 "# .....#. #....#",
                 "# ##..... #.#..#",
-                "# ..#.... #..###",
+                "# ..#.... #..# #",
                 "# ....... #....#",
                 "# .......  ....#",
-                "#.##.##  ####.##",
-                "#   .##  .#  .##",
-                "#    ....##   .#",
+                "#.##.##  ####..#",
+                "#.  .##  ..  ..#",
+                "#.   ....##   .#",
                 "#################",
             ]
 
@@ -195,8 +208,11 @@ class MazeRunnerEnv:
         else:
             reward += self.config.wall_penalty
 
+        px, py = self.player
+        ex, ey = self.enemy.position
+
         # 2. Check collision immediately after player move
-        if self.player == self.enemy.position:
+        if max(abs(px - ex), abs(py - ey)) <= 1:
             self.done = True
             reward += self.config.death_penalty
         else:
@@ -213,11 +229,13 @@ class MazeRunnerEnv:
             else:
                 # 4. Enemy movement only if the game is not won or lost yet
                 self.enemy.move(self.maze.grid, self.player)
+                ex, ey = self.enemy.position
 
                 # Check collision again after enemy move
-                if self.player == self.enemy.position:
+                if max(abs(px - ex), abs(py - ey)) <= 1:
                     self.done = True
                     reward += self.config.death_penalty
+
 
         # Accumulate the final reward into the total score exactly once
         self.score += reward
@@ -300,7 +318,7 @@ class MazeRunnerEnv:
 
 
 class QLearningAgent:
-    """A tabular Q-learning agent that learns to navigate the maze."""
+    """A tabular Q-learning agent configured to match GameRunner expectations."""
 
     def __init__(
         self,
@@ -317,51 +335,96 @@ class QLearningAgent:
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
         self.min_epsilon = min_epsilon
-        self.q_table = {}  # Maps state string -> list of 4 Q-values
+        self.q_table = {}
 
-    def _get_state_key(self, obs):
-        """Converts the observation dict into a hashable string key for the Q-table."""
-        # To prevent the state space from exploding, we compress the observation
-        # into a feature: (player_pos, enemy_pos, hash_of_remaining_dots)
-        return f"{obs['player']}_{obs['enemy']}_{hash(obs['dots'])}"
 
-    def get_q_values(self, state_key):
-        """Returns the Q-values for a state, initializing them to 0 if new."""
-        if state_key not in self.q_table:
-            self.q_table[state_key] = [0.0] * self.action_size
-        return self.q_table[state_key]
+    def get_state_key(self, observation):
+        """Reduces complex observation space into a manageable state key."""
+        # Force player and enemy coordinates to be tuples to prevent unhashable type errors
+        player = tuple(observation["player"])
+        enemy = tuple(observation["enemy"])
+        dots = observation["dots"]
 
-    def act(self, obs):
-        """Epsilon-greedy action selection."""
-        state_key = self._get_state_key(obs)
-        q_values = self.get_q_values(state_key)
+        if dots:
+            closest_dot = min(dots, key=lambda d: abs(d[0] - player[0]) + abs(d[1] - player[1]))
+            dot_rel = (closest_dot[0] - player[0], closest_dot[1] - player[1])
+        else:
+            dot_rel = (0, 0)
 
-        # Exploration (Random step)
+        return (player, enemy, dot_rel)
+
+    def act(self, observation):
+        """Selects action using an epsilon-greedy policy (matches GameRunner)."""
+        state = self.get_state_key(observation)
+        if state not in self.q_table:
+            self.q_table[state] = [0.0] * self.action_size
+
+        # Exploration phase
         if random.random() < self.epsilon:
             return random.randint(0, self.action_size - 1)
 
-        # Exploitation (Best known step)
-        max_q = max(q_values)
-        # Handle ties randomly to ensure stable learning
-        best_actions = [i for i, q in enumerate(q_values) if q == max_q]
-        return random.choice(best_actions)
+        # Exploitation phase
+        return self.q_table[state].index(max(self.q_table[state]))
 
-    def learn(self, obs, action, reward, next_obs, done):
-        """Updates the Q-value based on the Bellman equation."""
-        state_key = self._get_state_key(obs)
-        next_state_key = self._get_state_key(next_obs)
+    def learn(self, state, action, reward, next_state, done):
+        """Updates Q-values using the Bellman equation."""
+        s_key = self.get_state_key(state)
+        ns_key = self.get_state_key(next_state)
 
-        current_q = self.get_q_values(state_key)[action]
-        max_next_q = max(self.get_q_values(next_state_key)) if not done else 0.0
+        if s_key not in self.q_table:
+            self.q_table[s_key] = [0.0] * self.action_size
+        if ns_key not in self.q_table:
+            self.q_table[ns_key] = [0.0] * self.action_size
 
-        # Temporal Difference (TD) target and update
-        td_target = reward + self.gamma * max_next_q
-        self.q_table[state_key][action] += self.lr * (td_target - current_q)
+        max_future_q = 0 if done else max(self.q_table[ns_key])
+        current_q = self.q_table[s_key][action]
+
+        # Q-learning core formula (Temporal Difference update)
+        self.q_table[s_key][action] = current_q + self.lr * (
+            reward + self.gamma * max_future_q - current_q
+        )
 
     def decay_epsilon(self):
-        """Reduces exploration over time as the agent becomes smarter."""
+        """Reduces exploration over time (matches GameRunner)."""
         if self.epsilon > self.min_epsilon:
             self.epsilon *= self.epsilon_decay
+
+    def save_q_table(self, filename="q_table.json"):
+        """Saves the Q-table to a JSON file by converting tuple keys to strings."""
+        # JSON keys must be strings, so we convert the tuple states to string representation
+        serializable_q_table = {str(key): value for key, value in self.q_table.items()}
+
+        with open(filename, "w") as f:
+            json.dump(
+                {"epsilon": self.epsilon, "q_table": serializable_q_table}, f, indent=4
+            )
+        print(
+            f"-> Agent successfully saved to {filename} (Total states: {len(self.q_table)})"
+        )
+
+    def load_q_table(self, filename="q_table.json"):
+        """Loads the Q-table from a JSON file and restores string keys back to tuples."""
+        if not os.path.exists(filename):
+            print(f"-> No save file found ({filename}). Starting fresh.")
+            return False
+
+        with open(filename, "r") as f:
+            data = json.load(f)
+
+        self.epsilon = data.get("epsilon", self.min_epsilon)
+        raw_q_table = data.get("q_table", {})
+
+        # Parse the stringified tuple keys back into actual Python tuples
+        self.q_table = {}
+        for key_str, value in raw_q_table.items():
+            # eval is safe here since we are parsing structured data created by our own save function
+            key_tuple = eval(key_str)
+            self.q_table[key_tuple] = value
+
+        print(
+            f"-> Model successfully loaded from {filename} (Epsilon: {self.epsilon:.3f}, States: {len(self.q_table)})"
+        )
+        return True
 
 
 class GameRunner:
@@ -443,7 +506,7 @@ class GameRunner:
 
     def run_replay_step_by_step(self):
         """Mode 3: Automated execution using the injected agent, records the trajectory,
-        then replays it step-by-step with a 0.5-second delay.
+        then replays it step-by-step with a delay.
         """
         import time
 
@@ -501,17 +564,43 @@ class GameRunner:
                     return
 
             print(f"Step {step_idx}: Score = {snapshot['score']}")
-            time.sleep(0.5)
+            time.sleep(0.1)
 
         pygame.quit()
 
 
-if __name__ == "__main__":
+# --- MAIN RUNNER BLOCK WITH CONFIGURATION FLAGS ---
+if __name__ == "__main__" and "google.colab" not in sys.modules:
+    # Execution mode configuration flags
+    is_manual = False      # Set to True to play manually, False to use the RL agent
+    is_replay = True      # Set to True to replay the agent's trajectory step-by-step
     env = MazeRunnerEnv()
-    agent = QLearningAgent(action_size=4)  # Or any other agent you build later
-    runner = GameRunner(env, agent)
 
-    # Choose your mode:
-    runner.run_manual()
-    runner.run_train(episodes=1000)
-    # runner.run_replay_step_by_step()
+    if is_manual:
+        # Mode 1: Manual gameplay controlled by the user via keyboard
+        # Environment initialization for manual play without training or agent logic
+        runner = GameRunner(env, None)
+        print("Starting game in Manual Mode...")
+        runner.run_manual()
+    else:
+        # Reinforcement Learning Pipeline (Agent training / Replay)
+        agent = QLearningAgent(action_size=4)
+
+        # Try to load existing knowledge checkpoint
+        has_save = agent.load_q_table("q_table.json")
+
+        runner = GameRunner(env, agent)
+
+        if not has_save:
+            # Train from scratch if no saved file exists
+            print("No checkpoint found. Starting initial training session...")
+            runner.run_train(episodes=1000)
+            agent.save_q_table("q_table.json")
+        else:
+            runner.run_train(episodes=1000)
+            agent.save_q_table("q_table.json")
+
+        if is_replay:
+            # Mode 3: Automated execution and step-by-step playback evaluation
+            print("Starting automated execution and playback...")
+            runner.run_replay_step_by_step()
