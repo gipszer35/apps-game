@@ -6,7 +6,6 @@ import json
 import os
 
 
-
 # Conditional top-level import for headless/Colab environment safety
 if "google.colab" not in sys.modules:
     import pygame
@@ -29,14 +28,13 @@ class Enemy:
 
     def move(self, grid, target):
         """Moves the enemy towards the target using BFS, with a chance to skip the turn."""
-        # 1. Configure the chance of freezing (doing nothing)
-        random_move_chance = 0.4 # some chance to stand still
+        # Configure the chance of freezing (doing nothing)
+        random_move_chance = 0.4  # some chance to stand still
 
         # If the chance triggers, do absolutely nothing and stay in place
         if random.random() < random_move_chance:
             return self.position
 
-        # 2. Else, execute the standard BFS pathfinding logic
         queue = deque([(self.position, [])])
         visited = {self.position}
 
@@ -129,10 +127,10 @@ class MazeRunnerEnv:
         def __init__(self):
             # Rewards and penalties
             self.dot_reward = 10
-            self.death_penalty = -100
+            self.death_penalty = -200
             self.completion_reward = 500
-            self.wall_penalty = -1
-            self.step_penalty = -1
+            self.wall_penalty = -5
+            self.step_penalty = -2
 
             # Action mapping dictionary
             self.action_mapping = {
@@ -192,7 +190,7 @@ class MazeRunnerEnv:
         self.steps += 1
         reward = self.config.step_penalty
 
-        # 1. Player movement via configuration mapping
+        # Player movement via configuration mapping
         dx, dy = self.config.action_mapping[action]
         px, py = self.player
         target_pos = (px + dx, py + dy)
@@ -211,12 +209,12 @@ class MazeRunnerEnv:
         px, py = self.player
         ex, ey = self.enemy.position
 
-        # 2. Check collision immediately after player move
+        # Check collision immediately after player move
         if max(abs(px - ex), abs(py - ey)) <= 1:
             self.done = True
             reward += self.config.death_penalty
         else:
-            # 3. Handle dot collection if still alive
+            # Handle dot collection if still alive
             if self.player in self.maze.dots:
                 self.maze.dots.remove(self.player)
                 self.collected += 1
@@ -227,7 +225,7 @@ class MazeRunnerEnv:
                 self.done = True
                 reward += self.config.completion_reward
             else:
-                # 4. Enemy movement only if the game is not won or lost yet
+                # Enemy movement only if the game is not won or lost yet
                 self.enemy.move(self.maze.grid, self.player)
                 ex, ey = self.enemy.position
 
@@ -235,7 +233,6 @@ class MazeRunnerEnv:
                 if max(abs(px - ex), abs(py - ey)) <= 1:
                     self.done = True
                     reward += self.config.death_penalty
-
 
         # Accumulate the final reward into the total score exactly once
         self.score += reward
@@ -337,30 +334,43 @@ class QLearningAgent:
         self.min_epsilon = min_epsilon
         self.q_table = {}
 
-
     def get_state_key(self, observation):
         """Reduces complex observation space into a manageable state key."""
         # Force player and enemy coordinates to be tuples to prevent unhashable type errors
         player = tuple(observation["player"])
         enemy = tuple(observation["enemy"])
         dots = observation["dots"]
-
+        # 1. Calculate relative vector to the closest dot
         if dots:
-            closest_dot = min(dots, key=lambda d: abs(d[0] - player[0]) + abs(d[1] - player[1]))
+            closest_dot = min(
+                dots, key=lambda d: abs(d[0] - player[0]) + abs(d[1] - player[1])
+            )
             dot_rel = (closest_dot[0] - player[0], closest_dot[1] - player[1])
         else:
             dot_rel = (0, 0)
 
-        return (player, enemy, dot_rel)
+        dx = enemy[0] - player[0]
+        dy = enemy[1] - player[1]
+
+        if abs(dx) + abs(dy) > 6:
+            #enemy_rel = (9999 - dx, 9999 - dy)
+            enemy_rel = (9999, 9999)
+        else:
+            enemy_rel = (dx, dy)
+
+        return (player, enemy_rel, dot_rel)
 
     def act(self, observation):
-        """Selects action using an epsilon-greedy policy (matches GameRunner)."""
+        """Selects action using an epsilon-greedy policy with random fallback for new states."""
         state = self.get_state_key(observation)
+        is_new_state = False
+
         if state not in self.q_table:
             self.q_table[state] = [0.0] * self.action_size
+            is_new_state = True
 
-        # Exploration phase
-        if random.random() < self.epsilon:
+        # Exploration phase (or if the state was never visited before)
+        if is_new_state or random.random() < self.epsilon:
             return random.randint(0, self.action_size - 1)
 
         # Exploitation phase
@@ -429,9 +439,9 @@ class QLearningAgent:
 
 class GameRunner:
     """Handles different execution modes for the Maze Runner environment:
-    1. MANUAL: Interactive keyboard control.
-    2. TRAIN: Training loop using the injected RL agent.
-    3. REPLAY: Uses the injected agent to play, records it, then replays it.
+    MANUAL: Interactive keyboard control.
+    TRAIN: Training loop using the injected RL agent.
+    REPLAY: Uses the injected agent to play, records it, then replays it.
     """
 
     def __init__(self, env, agent):
@@ -478,15 +488,9 @@ class GameRunner:
             total_reward = 0
 
             while not done:
-                # 1. Agent chooses action based on its current policy
                 action = self.agent.act(obs)
-
-                # 2. Environment executes the action
                 next_obs, reward, done, truncated, info = self.env.step(action)
-
-                # 3. Agent learns from the experience transition
                 self.agent.learn(obs, action, reward, next_obs, done)
-
                 obs = next_obs
                 total_reward += reward
 
@@ -513,7 +517,7 @@ class GameRunner:
         print("Generating a game trajectory using the agent...")
         obs, info = self.env.reset()
 
-        # 1. Record phase (playing a game using the agent's logic)
+        #  Record phase (playing a game using the agent's logic)
         history = []
         history.append(
             {
@@ -543,7 +547,6 @@ class GameRunner:
                 }
             )
 
-        # 2. Step-by-step playback phase
         print(f"Playing back {len(history)} steps with 0.5s intervals...")
         self.env.reset()
         self.env.render_pygame()
@@ -572,9 +575,10 @@ class GameRunner:
 # --- MAIN RUNNER BLOCK WITH CONFIGURATION FLAGS ---
 if __name__ == "__main__" and "google.colab" not in sys.modules:
     # Execution mode configuration flags
-    is_manual = False      # Set to True to play manually, False to use the RL agent
-    is_replay = True      # Set to True to replay the agent's trajectory step-by-step
+    is_manual = False  # Set to True to play manually, False to use the RL agent
+    is_replay = True  # Set to True to replay the agent's trajectory step-by-step
     env = MazeRunnerEnv()
+    episodes = 1000
 
     if is_manual:
         # Mode 1: Manual gameplay controlled by the user via keyboard
@@ -594,10 +598,10 @@ if __name__ == "__main__" and "google.colab" not in sys.modules:
         if not has_save:
             # Train from scratch if no saved file exists
             print("No checkpoint found. Starting initial training session...")
-            runner.run_train(episodes=1000)
+            runner.run_train(episodes=episodes)
             agent.save_q_table("q_table.json")
         else:
-            runner.run_train(episodes=1000)
+            runner.run_train(episodes=episodes)
             agent.save_q_table("q_table.json")
 
         if is_replay:
